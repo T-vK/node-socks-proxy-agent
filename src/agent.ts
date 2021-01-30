@@ -4,7 +4,7 @@ import tls from 'tls';
 import url from 'url';
 import createDebug from 'debug';
 import { Agent, ClientRequest, RequestOptions } from 'agent-base';
-import { SocksClient, SocksProxy, SocksClientOptions } from 'socks';
+import { SocksClient, SocksProxy, SocksClientOptions, SocksClientChainOptions } from 'socks';
 import { SocksProxyAgentOptions } from '.';
 
 const debug = createDebug('socks-proxy-agent');
@@ -113,26 +113,38 @@ function parseSocksProxy(
  * @api public
  */
 export default class SocksProxyAgent extends Agent {
-	private lookup: boolean;
-	private proxy: SocksProxy;
+	private lookups: boolean[];
+	private proxies: SocksProxy[];
 
-	constructor(_opts: string | SocksProxyAgentOptions) {
-		let opts: SocksProxyAgentOptions;
-		if (typeof _opts === 'string') {
-			opts = url.parse(_opts);
+	constructor(rawOpts: string | SocksProxyAgentOptions | (string|SocksProxyAgentOptions)[]) {
+		// Turn rawOpts into an array if it isn't already:
+		let rawOptsArray: (string|SocksProxyAgentOptions)[];
+		if(!Array.isArray(rawOpts)) {
+            rawOptsArray = [rawOpts];
 		} else {
-			opts = _opts;
+			rawOptsArray = rawOpts;
 		}
-		if (!opts) {
-			throw new TypeError(
-				'a SOCKS proxy server `host` and `port` must be specified!'
-			);
+
+		// If rawOptsArray contains strings, convert it into a pure array of SocksProxyAgentOptions:
+		let opts: SocksProxyAgentOptions[] = [];
+		for (const rawOpt of rawOptsArray) {
+			if (typeof rawOpt === 'string') {
+				debug(url.parse(rawOpt))
+				opts.push(url.parse(rawOpt)); // Convert from string to SocksProxyAgentOptions
+			} else {
+				opts.push(rawOpt);
+			}
+			if (!rawOpt) {
+				throw new TypeError(
+					'a SOCKS proxy server `host` and `port` must be specified!'
+				);
+			}
 		}
 		super(opts);
 
-		const parsedProxy = parseSocksProxy(opts);
-		this.lookup = parsedProxy.lookup;
-		this.proxy = parsedProxy.proxy;
+		const parsedProxies = opts.map(o=>parseSocksProxy(o));
+		this.lookups = parsedProxies.map(p => p.lookup);
+		this.proxies = parsedProxies.map(p => p.proxy);
 	}
 
 	/**
@@ -145,26 +157,39 @@ export default class SocksProxyAgent extends Agent {
 		req: ClientRequest,
 		opts: RequestOptions
 	): Promise<net.Socket> {
-		const { lookup, proxy } = this;
+		const { lookups, proxies } = this;
+
 		let { host, port } = opts;
 
 		if (!host) {
 			throw new Error('No `host` defined!');
 		}
 
-		if (lookup) {
+		if (lookups.length>0 && lookups) {
 			// Client-side DNS resolution for "4" and "5" socks proxy versions.
-			host = await dnsLookup(host);
+			host = await dnsLookup(host); // This would leak your IP address. Not ideal.
 		}
 
-		const socksOpts: SocksClientOptions = {
-			proxy,
-			destination: { host, port },
-			command: 'connect'
-		};
-		debug('Creating socks proxy connection: %o', socksOpts);
-		const { socket } = await SocksClient.createConnection(socksOpts);
-		debug('Successfully created socks proxy connection');
+		let socket
+		if (proxies.length === 1) {
+			const socksOpts: SocksClientOptions = {
+				proxy: proxies[0],
+				destination: { host, port },
+				command: 'connect'
+			};
+			debug('Creating socks proxy connection: %o', socksOpts);
+			({ socket } = await SocksClient.createConnection(socksOpts));
+			debug('Successfully created socks proxy connection');
+		} else {
+			const socksOpts: SocksClientChainOptions = {
+				proxies,
+				destination: { host, port },
+				command: 'connect'
+			};
+			debug('Creating chained socks proxy connection: %o', socksOpts);
+			({ socket } = await SocksClient.createConnectionChain(socksOpts));
+			debug('Successfully created chained socks proxy connection');
+		}
 
 		if (opts.secureEndpoint) {
 			// The proxy is connecting to a TLS server, so upgrade
